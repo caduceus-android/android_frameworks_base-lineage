@@ -460,6 +460,13 @@
         <service android:name="SystemUIService"
             android:exported="true"
         />
+        <service
+            android:name=".ax.AxPlatformBinderService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.android.systemui.action.AX_PLATFORM" />
+            </intent-filter>
+        </service>
         <service android:name=".wallet.controller.WalletContextualLocationsService"
             android:exported="true"
             />
