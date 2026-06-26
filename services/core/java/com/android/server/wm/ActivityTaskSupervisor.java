@@ -1903,6 +1903,11 @@ public class ActivityTaskSupervisor implements RecentTasks.Callbacks {
             }
             mBalController.checkActivityAllowedToClearTask(
                             task, callingUid, callingPid, callerActivityClassName);
+            final IAxSandboxService sandboxService =
+                    LocalServices.getService(IAxSandboxService.class);
+            if (sandboxService != null) {
+                sandboxService.removeTask(task, reason);
+            }
             final GameSpaceService gameSpaceService =
                     LocalServices.getService(GameSpaceService.class);
             if (gameSpaceService != null) {
@@ -3018,6 +3023,9 @@ public class ActivityTaskSupervisor implements RecentTasks.Callbacks {
                     // Don't move home forward if task is in multi window mode
                     moveHomeTaskForward = false;
                 }
+
+                IAxSandboxService.get().clearUnlockedApp();
+                IAxSandboxService.get().lockTopApp(task, "startActivityFromRecents");
 
                 if (moveHomeTaskForward) {
                     // We always want to return to the home activity instead of the recents
