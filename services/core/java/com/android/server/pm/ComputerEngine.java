@@ -145,6 +145,7 @@ import com.android.modules.utils.TypedXmlSerializer;
 import com.android.server.LocalManagerRegistry;
 import com.android.server.LocalServices;
 import com.android.server.ondeviceintelligence.OnDeviceIntelligenceManagerLocal;
+import com.android.server.pm.InstallSource;
 import com.android.server.pm.parsing.PackageInfoUtils;
 import com.android.server.pm.parsing.pkg.AndroidPackageUtils;
 import com.android.server.pm.permission.PermissionManagerServiceInternal;
@@ -520,12 +521,12 @@ public class ComputerEngine implements Computer {
         return true;
     }
 
-    private boolean shouldHideFromCaller(int callingUid, String targetPackage) {
+    private boolean shouldHideFromCaller(int callingUid, String targetPackage, int targetUserId) {
         if (!isSystemReady()) return false;
 
         if (targetPackage == null) return false;
 
-        if (!AxSandboxService.get().isPackageHidden(targetPackage)) return false;
+        if (!AxSandboxService.get().isPackageHidden(targetPackage, targetUserId)) return false;
 
         if (PACKAGES_SHOULD_NOT_HIDE.contains(targetPackage)) return false;
 
@@ -563,23 +564,28 @@ public class ComputerEngine implements Computer {
     private static final int SPOOF_INSTALL_SYSTEM = 2;
     private static final String VENDING_PACKAGE = "com.android.vending";
 
-    private int shouldSpoofInstallSource(int callingUid, String targetPackage) {
-        if (!isSystemReady()) return SPOOF_INSTALL_DISABLED;
-        if (targetPackage == null) return SPOOF_INSTALL_DISABLED;
-        if (!AxSandboxService.get().isPackageHidden(targetPackage)) return SPOOF_INSTALL_DISABLED;
-        if (callingUid == Process.SYSTEM_UID || callingUid == Process.ROOT_UID)
+    private int shouldSpoofInstallSource(int callingUid, String targetPackage, int targetUserId) {
+        if (!isSystemReady() || targetPackage == null) {
             return SPOOF_INSTALL_DISABLED;
-        if (Process.isIsolated(callingUid) || Process.isSdkSandboxUid(callingUid))
+        }
+        if (!AxSandboxService.get().isPackageHidden(targetPackage, targetUserId)) {
             return SPOOF_INSTALL_DISABLED;
+        }
+        if (callingUid == Process.SYSTEM_UID || callingUid == Process.ROOT_UID) {
+            return SPOOF_INSTALL_DISABLED;
+        }
+        if (Process.isIsolated(callingUid) || Process.isSdkSandboxUid(callingUid)) {
+            return SPOOF_INSTALL_DISABLED;
+        }
 
         String callingPkg = null;
         final ActivityManagerInternal ami = getAmInternal();
         if (ami != null) {
             callingPkg = ami.getPackageNameByPid(Binder.getCallingPid());
         }
-        if (callingPkg == null) return SPOOF_INSTALL_DISABLED;
-        if (AxSandboxService.BLACKLISTED_PACKAGES.contains(callingPkg)) return SPOOF_INSTALL_DISABLED;
-        if (callingPkg.equals(targetPackage)) return SPOOF_INSTALL_DISABLED;
+        if (callingPkg == null || AxSandboxService.BLACKLISTED_PACKAGES.contains(callingPkg) || callingPkg.equals(targetPackage)) {
+            return SPOOF_INSTALL_DISABLED;
+        }
 
         final PackageStateInternal ps = mSettings.getPackage(targetPackage);
         if (ps != null && ps.isSystem()) {
@@ -588,14 +594,14 @@ public class ComputerEngine implements Computer {
         return SPOOF_INSTALL_USER;
     }
 
-    private final boolean isAppDetached(String packageName) {
+    private final boolean isAppDetached(String packageName, int userId) {
         if (!isSystemReady()) return false;
 
         if (packageName == null || TextUtils.isEmpty(packageName)) {
             return false;
         }
 
-        if (!AxSandboxService.get().isPackageSandboxed(packageName)) {
+        if (!AxSandboxService.get().isPackageSandboxed(packageName, userId)) {
             return false;
         }
 
@@ -1152,8 +1158,8 @@ public class ComputerEngine implements Computer {
 
     public final ApplicationInfo getApplicationInfo(String packageName,
             @PackageManager.ApplicationInfoFlagsBits long flags, int userId) {
-        if (isAppDetached(packageName)) return null;
-        if (shouldHideFromCaller(Binder.getCallingUid(), packageName)) return null;
+        if (isAppDetached(packageName, userId)) return null;
+        if (shouldHideFromCaller(Binder.getCallingUid(), packageName, userId)) return null;
         return getApplicationInfoInternal(packageName, flags, Binder.getCallingUid(), userId);
     }
 
@@ -1167,8 +1173,8 @@ public class ComputerEngine implements Computer {
             @PackageManager.ApplicationInfoFlagsBits long flags,
             int filterCallingUid, int userId) {
         if (!mUserManager.exists(userId)) return null;
-        if (isAppDetached(packageName)) return null;
-        if (shouldHideFromCaller(filterCallingUid, packageName)) return null;
+        if (isAppDetached(packageName, userId)) return null;
+        if (shouldHideFromCaller(filterCallingUid, packageName, userId)) return null;
         flags = updateFlagsForApplication(flags, userId);
 
         if (!isRecentsAccessingChildProfiles(Binder.getCallingUid(), userId)) {
@@ -1190,7 +1196,7 @@ public class ComputerEngine implements Computer {
     public List<ApplicationInfo> recreateApplicationList(
             int callingUid, Context context, int userId, List<ApplicationInfo> list) {
         List<ApplicationInfo> appList = new ArrayList<>(list);
-        appList.removeIf(info -> isAppDetached(info.packageName));
+        appList.removeIf(info -> isAppDetached(info.packageName, userId));
         return appList;
     }
 
@@ -1403,7 +1409,7 @@ public class ComputerEngine implements Computer {
         for (int i = resolveInfos.size() - 1; i >= 0; i--) {
             final ResolveInfo info = resolveInfos.get(i);
             if (info.activityInfo != null
-                    && shouldHideFromCaller(filterCallingUid, info.activityInfo.packageName)) {
+                    && shouldHideFromCaller(filterCallingUid, info.activityInfo.packageName, userId)) {
                 resolveInfos.remove(i);
                 continue;
             }
@@ -1795,8 +1801,8 @@ public class ComputerEngine implements Computer {
 
     public final PackageInfo getPackageInfo(String packageName,
             @PackageManager.PackageInfoFlagsBits long flags, int userId) {
-        if (isAppDetached(packageName)) return null;
-        if (shouldHideFromCaller(Binder.getCallingUid(), packageName)) return null;
+        if (isAppDetached(packageName, userId)) return null;
+        if (shouldHideFromCaller(Binder.getCallingUid(), packageName, userId)) return null;
         return getPackageInfoInternal(packageName, PackageManager.VERSION_CODE_HIGHEST,
                 flags, Binder.getCallingUid(), userId);
     }
@@ -1810,7 +1816,7 @@ public class ComputerEngine implements Computer {
     public final PackageInfo getPackageInfoInternal(String packageName, long versionCode,
             long flags, int filterCallingUid, int userId) {
         if (!mUserManager.exists(userId)) return null;
-        if (shouldHideFromCaller(filterCallingUid, packageName)) return null;
+        if (shouldHideFromCaller(filterCallingUid, packageName, userId)) return null;
         flags = updateFlagsForPackage(flags, userId);
         enforceCrossUserPermission(Binder.getCallingUid(), userId,
                 false /* requireFullPermission */, false /* checkShell */, "get package info");
@@ -1998,6 +2004,7 @@ public class ComputerEngine implements Computer {
                 }
             }
         }
+        list.removeIf(info -> isAppDetached(info.packageName, userId));
         return new PackageInfoList(list);
     }
 
@@ -2777,7 +2784,7 @@ public class ComputerEngine implements Computer {
         final boolean callerIsInstantApp = instantAppPkgName != null;
         final boolean packageArchivedForUser = ps != null && PackageArchiver.isArchived(
                 ps.getUserStateOrDefault(userId));
-        if (ps != null && isAppDetached(ps.getPackageName())) {
+        if (ps != null && isAppDetached(ps.getPackageName(), userId)) {
             return true;
         }
         // Don't treat hiddenUntilInstalled as an uninstalled state, phone app needs to access
@@ -4851,7 +4858,7 @@ public class ComputerEngine implements Computer {
     private void addPackageHoldingPermissions(ArrayList<PackageInfo> list, PackageStateInternal ps,
             String[] permissions, boolean[] tmp, @PackageManager.PackageInfoFlagsBits long flags,
             int userId) {
-        if (shouldHideFromCaller(Binder.getCallingUid(), ps.getPackageName())) return;
+        if (shouldHideFromCaller(Binder.getCallingUid(), ps.getPackageName(), userId)) return;
         int numMatch = 0;
         for (int i=0; i<permissions.length; i++) {
             final String permission = permissions[i];
@@ -4939,7 +4946,7 @@ public class ComputerEngine implements Computer {
                     if (shouldFilterApplication(ps, callingUid, userId)) {
                         continue;
                     }
-                    if (shouldHideFromCaller(callingUid, ps.getPackageName())) {
+                    if (shouldHideFromCaller(callingUid, ps.getPackageName(), userId)) {
                         continue;
                     }
                     ai = PackageInfoUtils.generateApplicationInfo(ps.getPkg(), effectiveFlags,
@@ -4973,7 +4980,7 @@ public class ComputerEngine implements Computer {
                 if (shouldFilterApplication(packageState, callingUid, userId)) {
                     continue;
                 }
-                if (shouldHideFromCaller(callingUid, packageState.getPackageName())) {
+                if (shouldHideFromCaller(callingUid, packageState.getPackageName(), userId)) {
                     continue;
                 }
                 ApplicationInfo ai = PackageInfoUtils.generateApplicationInfo(pkg, flags,
@@ -5345,7 +5352,7 @@ public class ComputerEngine implements Computer {
     @Override
     public String getInstallerPackageName(@NonNull String packageName, @UserIdInt int userId) {
         final int callingUid = Binder.getCallingUid();
-        int spoofResult = shouldSpoofInstallSource(callingUid, packageName);
+        int spoofResult = shouldSpoofInstallSource(callingUid, packageName, userId);
         if (spoofResult == SPOOF_INSTALL_USER) return VENDING_PACKAGE;
         if (spoofResult == SPOOF_INSTALL_SYSTEM) return null;
         final InstallSource installSource = getInstallSource(packageName, callingUid, userId);
@@ -5389,7 +5396,7 @@ public class ComputerEngine implements Computer {
         enforceCrossUserPermission(callingUid, userId, false /* requireFullPermission */,
                 false /* checkShell */, "getInstallSourceInfo");
 
-        int spoofResult = shouldSpoofInstallSource(callingUid, packageName);
+        int spoofResult = shouldSpoofInstallSource(callingUid, packageName, userId);
         if (spoofResult == SPOOF_INSTALL_USER) {
             return new InstallSourceInfo(
                     VENDING_PACKAGE, null, VENDING_PACKAGE,
@@ -5782,7 +5789,7 @@ public class ComputerEngine implements Computer {
         if (pkg == null) {
             return false;
         }
-        if (shouldSpoofInstallSource(callingUid, pkg.getPackageName()) != SPOOF_INSTALL_DISABLED) {
+        if (shouldSpoofInstallSource(callingUid, pkg.getPackageName(), UserHandle.getUserId(callingUid)) != SPOOF_INSTALL_DISABLED) {
             return false;
         }
         final PackageStateInternal packageState = getPackageStateInternal(pkg.getPackageName());
