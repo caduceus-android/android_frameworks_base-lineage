@@ -275,7 +275,9 @@ public final class NotificationAttentionHelper {
                 "file://" + resources.getString(R.string.config_inCallNotificationSound));
         mInCallNotificationAudioAttributes = new AudioAttributes.Builder()
                 .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                // Not USAGE_VOICE_COMMUNICATION: audio policy gives that the call's own
+                // VoIP output, and a second stream there can change the call's volume
+                .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
                 .build();
         mInCallNotificationVolume = resources.getFloat(R.dimen.config_inCallNotificationVolume);
 
