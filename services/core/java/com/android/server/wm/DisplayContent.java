@@ -1179,7 +1179,8 @@ class DisplayContent extends RootDisplayArea implements WindowManagerPolicy.Disp
                     mTmpApplySurfaceChangesTransactionState.syswin = true;
                 }
                 if (mTmpApplySurfaceChangesTransactionState.preferredRefreshRate == 0
-                        && w.mAttrs.preferredRefreshRate != 0) {
+                        && w.mAttrs.preferredRefreshRate != 0
+                        && !w.inPinnedWindowingMode()) {
                     mTmpApplySurfaceChangesTransactionState.preferredRefreshRate
                             = w.mAttrs.preferredRefreshRate;
                 }
@@ -1202,7 +1203,8 @@ class DisplayContent extends RootDisplayArea implements WindowManagerPolicy.Disp
                 final float preferredMinRefreshRate = refreshRatePolicy
                         .getPreferredMinRefreshRate(w);
                 if (mTmpApplySurfaceChangesTransactionState.preferredMinRefreshRate == 0
-                        && preferredMinRefreshRate != 0) {
+                        && preferredMinRefreshRate != 0
+                        && !w.inPinnedWindowingMode()) {
                     mTmpApplySurfaceChangesTransactionState.preferredMinRefreshRate =
                             preferredMinRefreshRate;
                 }
@@ -1210,7 +1212,8 @@ class DisplayContent extends RootDisplayArea implements WindowManagerPolicy.Disp
                 final float preferredMaxRefreshRate = refreshRatePolicy
                         .getPreferredMaxRefreshRate(w);
                 if (mTmpApplySurfaceChangesTransactionState.preferredMaxRefreshRate == 0
-                        && preferredMaxRefreshRate != 0) {
+                        && preferredMaxRefreshRate != 0
+                        && !w.inPinnedWindowingMode()) {
                     mTmpApplySurfaceChangesTransactionState.preferredMaxRefreshRate =
                             preferredMaxRefreshRate;
                 }
