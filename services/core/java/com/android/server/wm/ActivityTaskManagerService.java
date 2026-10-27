@@ -46,6 +46,7 @@ import static android.app.HandoffFailureCode.HANDOFF_FAILURE_UNKNOWN_TASK;
 import static android.app.HandoffFailureCode.HANDOFF_FAILURE_UNSUPPORTED_DEVICE;
 import static android.app.HandoffFailureCode.HANDOFF_FAILURE_UNSUPPORTED_TASK;
 import static android.app.WindowConfiguration.ACTIVITY_TYPE_DREAM;
+import static android.app.WindowConfiguration.WINDOWING_MODE_FREEFORM;
 import static android.app.WindowConfiguration.WINDOWING_MODE_PINNED;
 import static android.content.Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS;
 import static android.content.Intent.FLAG_ACTIVITY_NEW_TASK;
@@ -340,6 +341,8 @@ import java.util.Set;
  */
 public class ActivityTaskManagerService extends IActivityTaskManager.Stub {
     private static final String TAG = TAG_WITH_CLASS_NAME ? "ActivityTaskManagerService" : TAG_ATM;
+    private static final String LMO_FREEFORM_PACKAGE = "com.libremobileos.freeform";
+    private static final String LMO_FREEFORM_ACTION = "com.libremobileos.freeform.START_FREEFORM";
     static final String TAG_ROOT_TASK = TAG + POSTFIX_ROOT_TASK;
     static final String TAG_SWITCH = TAG + POSTFIX_SWITCH;
 
@@ -1946,11 +1949,54 @@ public class ActivityTaskManagerService extends IActivityTaskManager.Stub {
                 bOptions, callingPid, callingUid);
         final long origId = Binder.clearCallingIdentity();
         try {
+            if (startFromRecentsInLmoFreeform(taskId, safeOptions)) {
+                return ActivityManager.START_SUCCESS;
+            }
             return mTaskSupervisor.startActivityFromRecents(callingPid, callingUid, taskId,
                     safeOptions);
         } finally {
             Binder.restoreCallingIdentity(origId);
         }
+    }
+
+    /**
+     * Hands a freeform launch from recents to LMOFreeform when the internal display cannot host
+     * desktops. The shell only keeps freeform tasks inside a desk, so without one the task would
+     * be left stranded on the default display.
+     */
+    private boolean startFromRecentsInLmoFreeform(int taskId, SafeActivityOptions safeOptions) {
+        final ActivityOptions options =
+                safeOptions != null ? safeOptions.getOriginalOptions() : null;
+        if (options == null || options.getLaunchWindowingMode() != WINDOWING_MODE_FREEFORM) {
+            return false;
+        }
+        if (DesktopModeHelper.canEnterDesktopMode(mContext)
+                && DesktopModeHelper.isDesktopModeSupportedOnInternalDisplay(mContext)) {
+            return false;
+        }
+        final ComponentName activity;
+        final int userId;
+        synchronized (mGlobalLock) {
+            final Task task = mRootWindowContainer.anyTaskForId(taskId,
+                    MATCH_ATTACHED_TASK_OR_RECENT_TASKS);
+            if (task == null || task.realActivity == null) {
+                return false;
+            }
+            activity = task.realActivity;
+            userId = task.mUserId;
+        }
+        // LMOFreeform moves the task to its window and starts the activity if that fails
+        final Intent intent = new Intent(LMO_FREEFORM_ACTION)
+                .setPackage(LMO_FREEFORM_PACKAGE)
+                .putExtra("packageName", activity.getPackageName())
+                .putExtra("activityName", activity.getClassName())
+                .putExtra("userId", userId)
+                .putExtra("taskId", taskId);
+        if (mContext.getPackageManager().queryBroadcastReceivers(intent, 0).isEmpty()) {
+            return false;
+        }
+        mContext.sendBroadcastAsUser(intent, UserHandle.CURRENT);
+        return true;
     }
 
     @Override
