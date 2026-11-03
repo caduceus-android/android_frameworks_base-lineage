@@ -2739,12 +2739,9 @@ public class DisplayDeviceConfig {
         mBacklightToBrightnessSpline = mInterpolationType == INTERPOLATION_LINEAR
                 ? Spline.createLinearSpline(mBacklight, mBrightness)
                 : Spline.createSpline(mBacklight, mBrightness);
-        mBacklightToNitsSpline = mInterpolationType == INTERPOLATION_LINEAR
-                ? Spline.createLinearSpline(mBacklight, mNits)
-                : Spline.createSpline(mBacklight, mNits);
-        mNitsToBacklightSpline = mInterpolationType == INTERPOLATION_LINEAR
-                ? Spline.createLinearSpline(mNits, mBacklight)
-                : Spline.createSpline(mNits, mBacklight);
+        // Always linear, as on HyperOS, so nits and backlight convert back and forth exactly
+        mBacklightToNitsSpline = Spline.createLinearSpline(mBacklight, mNits);
+        mNitsToBacklightSpline = Spline.createLinearSpline(mNits, mBacklight);
     }
 
     private void loadQuirks(DisplayConfiguration config) {

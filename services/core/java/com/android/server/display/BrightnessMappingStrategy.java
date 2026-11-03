@@ -1242,8 +1242,11 @@ public abstract class BrightnessMappingStrategy {
         }
 
         private void computeNitsBrightnessSplines(float[] nits) {
-            mNitsToBrightnessSpline = Spline.createSpline(nits, mBrightness);
-            mBrightnessToNitsSpline = Spline.createSpline(mBrightness, nits);
+            // Linear, as on HyperOS: the curve's nits go to brightness and back to nits, and
+            // two monotone cubic splines over a sparse map (onyx has three points) are not
+            // inverses of each other, which left the screen up to 40% dimmer than the curve
+            mNitsToBrightnessSpline = Spline.createLinearSpline(nits, mBrightness);
+            mBrightnessToNitsSpline = Spline.createLinearSpline(mBrightness, nits);
         }
 
         private void computeSpline() {
