@@ -43,6 +43,7 @@ import android.os.HandlerExecutor;
 import android.os.Looper;
 import android.os.Message;
 import android.os.RemoteException;
+import android.os.VibrationAttributes;
 import android.os.VibrationEffect;
 import android.provider.Settings;
 import android.service.notification.Condition;
@@ -119,6 +120,18 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
                     .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                     .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
                     .build();
+    // Volume keys: a crisp click for each step, one firmer thud when the key hits the end of the
+    // range. Hardware feedback, so it follows the vibration intensity setting for it.
+    private static final VibrationAttributes VOLUME_KEY_VIBRATION_ATTRIBUTES =
+            VibrationAttributes.createForUsage(VibrationAttributes.USAGE_HARDWARE_FEEDBACK);
+    private static final VibrationEffect VOLUME_KEY_STEP_EFFECT =
+            VibrationEffect.startComposition()
+                    .addPrimitive(VibrationEffect.Composition.PRIMITIVE_CLICK, 0.7f)
+                    .compose();
+    private static final VibrationEffect VOLUME_KEY_LIMIT_EFFECT =
+            VibrationEffect.startComposition()
+                    .addPrimitive(VibrationEffect.Composition.PRIMITIVE_THUD, 1f)
+                    .compose();
 
     static final ArrayMap<Integer, Integer> STREAMS = new ArrayMap<>();
     static {
@@ -167,6 +180,7 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
     private boolean mShowSafetyWarning;
     private long mLastToggledRingerOn;
     private boolean mDeviceInteractive = true;
+    private boolean mVolumeKeyLimitVibrated;
     boolean mInAudioSharing = false;
 
     private VolumePolicy mVolumePolicy;
@@ -590,7 +604,8 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
             changed |= updateActiveStreamW(stream);
         }
         int lastAudibleStreamVolume = getAudioManagerStreamVolume(stream);
-        changed |= updateStreamLevelW(stream, lastAudibleStreamVolume);
+        final boolean levelChanged = updateStreamLevelW(stream, lastAudibleStreamVolume);
+        changed |= levelChanged;
         changed |= checkRoutedToBluetoothW(showUI ? AudioManager.STREAM_MUSIC : stream);
         if (changed && sendChanges) {
             mCallbacks.onStateChanged(mState);
@@ -608,7 +623,31 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
             Events.writeEvent(Events.EVENT_KEY, stream, lastAudibleStreamVolume);
             mCallbacks.onVolumeChangedFromKey();
         }
+        if (fromKey && !showVibrateHint && !showSilentHint) {
+            vibrateForVolumeKeyW(stream, levelChanged);
+        }
         return changed;
+    }
+
+    private void vibrateForVolumeKeyW(int stream, boolean levelChanged) {
+        if (!mHasVibrator) return;
+        // The same switch as the haptics of the volume dialog slider
+        if (mSecureSettings.getInt(Settings.Secure.VOLUME_DIALOG_HAPTIC_FEEDBACK, 1) == 0) return;
+        final StreamState ss = streamStateW(stream);
+        if (levelChanged) {
+            mVolumeKeyLimitVibrated = false;
+            // Ring and notification at the bottom switch the ringer mode, which vibrates itself
+            if (ss.level <= ss.levelMin && (stream == AudioSystem.STREAM_RING
+                    || stream == AudioSystem.STREAM_NOTIFICATION)) {
+                return;
+            }
+            mVibrator.vibrate(VOLUME_KEY_STEP_EFFECT, VOLUME_KEY_VIBRATION_ATTRIBUTES);
+        } else if (!mVolumeKeyLimitVibrated
+                && (ss.level <= ss.levelMin || ss.level >= ss.levelMax)) {
+            // Once at the end of the range, not again on every key repeat there
+            mVolumeKeyLimitVibrated = true;
+            mVibrator.vibrate(VOLUME_KEY_LIMIT_EFFECT, VOLUME_KEY_VIBRATION_ATTRIBUTES);
+        }
     }
 
     private boolean updateActiveStreamW(int activeStream) {
