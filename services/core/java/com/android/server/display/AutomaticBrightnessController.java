@@ -53,6 +53,8 @@ import android.os.RemoteException;
 import android.os.SystemClock;
 import android.os.SystemProperties;
 import android.os.Trace;
+import android.os.UserHandle;
+import android.provider.Settings;
 import android.util.EventLog;
 import android.util.IndentingPrintWriter;
 import android.util.MathUtils;
