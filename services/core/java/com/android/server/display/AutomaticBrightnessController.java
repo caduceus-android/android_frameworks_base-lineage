@@ -31,31 +31,48 @@ import android.app.TaskStackListener;
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
+import android.database.ContentObserver;
+import android.graphics.Rect;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
+import android.hardware.camera2.CameraManager;
 import android.hardware.display.BrightnessConfiguration;
+import android.hardware.display.DisplayManager;
+import android.hardware.display.DisplayManagerInternal;
 import android.hardware.display.DisplayManagerInternal.DisplayPowerRequest;
+import android.hardware.input.InputManager;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.Message;
 import android.os.PowerManager;
+import android.os.Process;
 import android.os.RemoteException;
 import android.os.SystemClock;
+import android.os.SystemProperties;
 import android.os.Trace;
 import android.util.EventLog;
 import android.util.IndentingPrintWriter;
 import android.util.MathUtils;
 import android.util.Slog;
 import android.util.SparseArray;
+import android.util.Spline;
 import android.util.TimeUtils;
 import android.view.Display;
+import android.view.DisplayInfo;
+import android.view.InputEvent;
+import android.view.InputEventReceiver;
+import android.view.InputMonitor;
+import android.view.MotionEvent;
+import android.view.Surface;
 
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.internal.display.BrightnessSynchronizer;
 import com.android.internal.os.BackgroundThread;
 import com.android.server.EventLogTags;
+import com.android.server.LocalServices;
 import com.android.server.display.brightness.BrightnessEvent;
 import com.android.server.display.brightness.clamper.BrightnessClamperController;
 import com.android.server.display.config.HysteresisLevels;
@@ -107,6 +124,49 @@ public class AutomaticBrightnessController {
     private static final int BRIGHTNESS_ADJUSTMENT_SAMPLE_DEBOUNCE_MILLIS = 10000;
 
     private static final int MSG_UPDATE_AMBIENT_LUX = 1;
+
+    // HyperOS auto brightness policy of onyx (MiuiAmbientPolicy), off with this property
+    private static final String PROP_MIUI_AMBIENT_POLICY = "persist.sys.display.dual_sensor_policy";
+    // xiaomi.sensor.back_lux, the rear ALS
+    private static final int MIUI_ASSIST_LIGHT_SENSOR_TYPE = 33171055;
+    private static final int MSG_UPDATE_ASSIST_LUX = 100;
+    private static final int MIUI_LUX_INVALID = 0;
+    private static final int MIUI_USE_MAIN_SENSOR = 1;
+    private static final int MIUI_USE_ASSIST_SENSOR = 2;
+    // framework-ext-res (android.miui) defaults, onyx does not overlay them:
+    // config_ambientBrighteningLux/Thresholds, config_ambientDarkeningLux/Thresholds
+    private static final float[] MIUI_BRIGHTENING_LUX = {0f, 3f, 4f, 6f, 7f, 8f, 9f, 15f, 30f,
+            600f, 1677.4f, 2000f, 2500f, 3000f, 8500f};
+    private static final float[] MIUI_BRIGHTENING_THRESHOLDS = {2f, 6f, 8.51f, 13.66f, 14.84f,
+            15.46f, 17.22f, 28.44f, 160f, 992.58f, 3000f, 4038.77f, 5738.77f, 7538.77f, 13038.8f};
+    private static final float[] MIUI_DARKENING_LUX = {0f, 1f, 7f, 8f, 9f, 10f, 11f, 12f, 13f,
+            14f, 15f, 30f, 199f, 200f, 360f, 600f, 1010.47f, 3000f, 20000f};
+    private static final float[] MIUI_DARKENING_THRESHOLDS = {0f, 0.32f, 3.53f, 3.8f, 4.1f,
+            4.45f, 4.82f, 5.2f, 5.58f, 6.05f, 6.9f, 15.83f, 34.31f, 41.39f, 45.34f, 216.99f, 600f,
+            2052.56f, 10012f};
+    // config_ratioForBrightenSmallThreshold, config_autoBrightnessSmallBrighteningLightDebounce
+    private static final float MIUI_RATIO_FOR_BRIGHTEN_SMALL_THRESHOLD = 0.6f;
+    private static final long MIUI_SMALL_BRIGHTENING_DEBOUNCE_MS = 5000;
+    // highBrightnessMode minimumLux of the onyx displayconfig: above it every lux step counts
+    private static final float MIUI_HBM_MINIMUM_LUX = 4475f;
+    // HyperOS keeps 5 s of light samples, so a debounce may be longer than the horizon
+    private static final long MIUI_RING_BUFFER_HORIZON_MS = 5000;
+    // config_allow_fast_rate_time (MiuiFrameworkResOverlay), config_allow_fast_rate_ratio,
+    // config_skip_transition_lux_value
+    private static final long MIUI_ALLOW_FAST_RATE_TIME_MS = 3000;
+    private static final float MIUI_ALLOW_FAST_RATE_RATIO = 0.6f;
+    private static final float MIUI_SKIP_TRANSITION_LUX = 20f;
+    // config_touch_cover_protection_rect (portrait, physical pixels) and
+    // config_auto_brightness_touch_event_debounce of MiuiFrameworkResOverlay
+    private static final int[] MIUI_TOUCH_COVER_RECT = {0, 0, 1440, 750};
+    private static final long MIUI_TOUCH_EVENT_DEBOUNCE_MS = 1000;
+    private static final long MIUI_TORCH_OFF_ASSIST_DELAY_MS = 1800;
+    // In a game, darker front samples are dropped for 60 s after it starts and for 180 s after
+    // the last touch over the ALS. HyperOS takes the games from a cloud list; here
+    // GameSpaceService sets this for the games of the ZeroEngine game list
+    private static final String MIUI_GAMING_MODE_ACTIVE = "ax_gaming_mode_active";
+    private static final long MIUI_GAME_ENTER_DROP_MS = 60000;
+    private static final long MIUI_GAME_TOUCH_DROP_MS = 180000;
     private static final int MSG_BRIGHTNESS_ADJUSTMENT_SAMPLE = 2;
     private static final int MSG_INVALIDATE_CURRENT_SHORT_TERM_MODEL = 3;
     private static final int MSG_UPDATE_FOREGROUND_APP = 4;
@@ -292,6 +352,9 @@ public class AutomaticBrightnessController {
 
     private boolean mAutoBrightnessOneShot;
 
+    private final MiuiAmbientPolicy mMiuiPolicy;
+    private float mAmbientBrighteningSmallThreshold;
+
     AutomaticBrightnessController(Callbacks callbacks, Looper looper,
             SensorManager sensorManager, Sensor lightSensor,
             SparseArray<BrightnessMappingStrategy> brightnessMappingStrategyMap,
@@ -370,6 +433,15 @@ public class AutomaticBrightnessController {
         if (!DEBUG_PRETEND_LIGHT_SENSOR_ABSENT) {
             mLightSensor = lightSensor;
         }
+
+        MiuiAmbientPolicy miuiPolicy = null;
+        if (SystemProperties.getBoolean(PROP_MIUI_AMBIENT_POLICY, true)) {
+            Sensor assistSensor = sensorManager.getDefaultSensor(MIUI_ASSIST_LIGHT_SENSOR_TYPE);
+            if (assistSensor != null) {
+                miuiPolicy = new MiuiAmbientPolicy(assistSensor, looper);
+            }
+        }
+        mMiuiPolicy = miuiPolicy;
 
         mActivityTaskManager = ActivityTaskManager.getService();
         mPackageManager = mContext.getPackageManager();
@@ -676,6 +748,9 @@ public class AutomaticBrightnessController {
         ipw.println("mRecentLightSamples=" + mRecentLightSamples);
         ipw.println("mAmbientLightRingBuffer=" + mAmbientLightRingBuffer);
         ipw.println("mScreenAutoBrightness=" + mScreenAutoBrightness);
+        if (mMiuiPolicy != null) {
+            mMiuiPolicy.dump(ipw);
+        }
         ipw.println("mDisplayPolicy=" + DisplayPowerRequest.policyToString(mDisplayPolicy));
         ipw.println("mShortTermModel=");
 
@@ -740,6 +815,9 @@ public class AutomaticBrightnessController {
                 registerForegroundAppUpdater();
                 mSensorManager.registerListener(mLightSensorListener, mLightSensor,
                         mCurrentLightSensorRate * 1000, mHandler);
+                if (mMiuiPolicy != null) {
+                    mMiuiPolicy.setEnabled(true);
+                }
                 return true;
             }
         } else if (mLightSensorEnabled) {
@@ -757,12 +835,22 @@ public class AutomaticBrightnessController {
             mHandler.removeMessages(MSG_UPDATE_AMBIENT_LUX);
             unregisterForegroundAppUpdater();
             mSensorManager.unregisterListener(mLightSensorListener);
+            if (mMiuiPolicy != null) {
+                mMiuiPolicy.setEnabled(false);
+            }
         }
         return false;
     }
 
     private void handleLightSensorEvent(long time, float lux) {
         Trace.traceCounter(Trace.TRACE_TAG_POWER, "ALS", (int) lux);
+        if (mMiuiPolicy != null && mAmbientLuxValid
+                && (mMiuiPolicy.isTouchCoverProtectionActive()
+                        || (lux <= mAmbientLightRingBuffer.getMaxLux(time,
+                                mAmbientLightHorizonShort)
+                                && mMiuiPolicy.dropDecreaseLuxInGame()))) {
+            return;
+        }
         mHandler.removeMessages(MSG_UPDATE_AMBIENT_LUX);
 
         if (mAmbientLightRingBuffer.size() == 0) {
@@ -775,7 +863,7 @@ public class AutomaticBrightnessController {
 
     private void applyLightSensorMeasurement(long time, float lux) {
         mRecentLightSamples++;
-        mAmbientLightRingBuffer.prune(time - mAmbientLightHorizonLong);
+        mAmbientLightRingBuffer.prune(time - getRingBufferHorizon());
         mAmbientLightRingBuffer.push(time, lux);
         // Remember this sample value.
         mLastObservedLux = lux;
@@ -815,6 +903,10 @@ public class AutomaticBrightnessController {
                     mAmbientBrightnessThresholdsIdle.getBrighteningThreshold(lux);
             mAmbientDarkeningThreshold =
                     mAmbientBrightnessThresholdsIdle.getDarkeningThreshold(lux);
+        } else if (mMiuiPolicy != null) {
+            mAmbientBrighteningThreshold = mMiuiPolicy.brighteningThreshold(lux);
+            mAmbientDarkeningThreshold = mMiuiPolicy.darkeningThreshold(lux);
+            mAmbientBrighteningSmallThreshold = mMiuiPolicy.brighteningSmallThreshold(lux);
         } else {
             mAmbientBrighteningThreshold =
                     mAmbientBrightnessThresholds.getBrighteningThreshold(lux);
@@ -905,6 +997,22 @@ public class AutomaticBrightnessController {
                 ? mBrighteningLightDebounceConfigIdle : mBrighteningLightDebounceConfig);
     }
 
+    // A rise below the full threshold but above the small one waits the longer debounce
+    private long nextAmbientLightBrighteningTransition(long time, float lux) {
+        final boolean small = lux < mAmbientBrighteningThreshold;
+        final float threshold = small
+                ? mAmbientBrighteningSmallThreshold : mAmbientBrighteningThreshold;
+        long earliestValidTime = time;
+        for (int i = mAmbientLightRingBuffer.size() - 1; i >= 0; i--) {
+            if (mAmbientLightRingBuffer.getLux(i) <= threshold) {
+                break;
+            }
+            earliestValidTime = mAmbientLightRingBuffer.getTime(i);
+        }
+        return earliestValidTime + (small
+                ? MIUI_SMALL_BRIGHTENING_DEBOUNCE_MS : mBrighteningLightDebounceConfig);
+    }
+
     private long nextAmbientLightDarkeningTransition(long time) {
         final int N = mAmbientLightRingBuffer.size();
         long earliestValidTime = time;
@@ -920,8 +1028,12 @@ public class AutomaticBrightnessController {
 
     private void updateAmbientLux() {
         long time = mClock.getSensorEventScaleTime();
-        mAmbientLightRingBuffer.prune(time - mAmbientLightHorizonLong);
+        mAmbientLightRingBuffer.prune(time - getRingBufferHorizon());
         updateAmbientLux(time);
+    }
+
+    private long getRingBufferHorizon() {
+        return mMiuiPolicy != null ? MIUI_RING_BUFFER_HORIZON_MS : mAmbientLightHorizonLong;
     }
 
     private void updateAmbientLux(long time) {
@@ -940,14 +1052,28 @@ public class AutomaticBrightnessController {
                         timeWhenSensorWarmedUp);
                 return;
             }
-            setAmbientLux(calculateAmbientLux(time, mAmbientLightHorizonShort));
+            if (mMiuiPolicy != null) {
+                mMiuiPolicy.initMainAmbientLux(
+                        calculateAmbientLux(time, mAmbientLightHorizonShort));
+            } else {
+                setAmbientLux(calculateAmbientLux(time, mAmbientLightHorizonShort));
+            }
             mAmbientLuxValid = true;
             if (mLoggingEnabled) {
                 Slog.d(TAG, "updateAmbientLux: Initializing: " +
                         "mAmbientLightRingBuffer=" + mAmbientLightRingBuffer + ", " +
                         "mAmbientLux=" + mAmbientLux);
             }
-            updateAutoBrightness(true /* sendUpdate */, false /* isManuallySet */);
+            if (mMiuiPolicy == null || mMiuiPolicy.isUsingMainSensor()) {
+                updateAutoBrightness(true /* sendUpdate */, false /* isManuallySet */);
+            }
+        }
+
+        if (mMiuiPolicy != null) {
+            if (!mMiuiPolicy.skipBrighteningTransition()) {
+                mMiuiPolicy.updateMainAmbientLux(time);
+            }
+            return;
         }
 
         long nextBrightenTransition = nextAmbientLightBrighteningTransition(time);
@@ -1634,6 +1760,23 @@ public class AutomaticBrightnessController {
             return mCount;
         }
 
+        public float getMaxLux(long now, long horizon) {
+            if (mCount == 0) {
+                return -1f;
+            }
+            // Like getWeights(), the sample in effect at the horizon start counts too
+            final long horizonStartTime = now - horizon;
+            int start = 0;
+            while (start < mCount - 1 && getTime(start + 1) <= horizonStartTime) {
+                start++;
+            }
+            float maxLux = getLux(start);
+            for (int i = start + 1; i < mCount; i++) {
+                maxLux = Math.max(maxLux, getLux(i));
+            }
+            return maxLux;
+        }
+
         public void clear() {
             mStart = 0;
             mEnd = 0;
@@ -1679,6 +1822,566 @@ public class AutomaticBrightnessController {
 
         public long getSensorEventScaleTime() {
             return SystemClock.elapsedRealtime();
+        }
+    }
+
+    /**
+     * Port of the HyperOS auto brightness policy of onyx (OS2.0.303, miui-services.jar:
+     * HysteresisLevelsImpl, DualSensorPolicy, TouchCoverProtectionHelper and the
+     * AutomaticBrightnessController changes in services.jar). Brightness follows the front
+     * (under-display) ALS; the rear ALS only takes over when it is brighter than the front
+     * brightening threshold, or when the front falls below it. Thresholds are absolute lux
+     * splines, with a smaller brightening step behind a longer debounce.
+     */
+    private static Handler sTouchCoverHandler;
+
+    // One thread for every controller, which is set up again when the display config changes
+    private static synchronized Handler getTouchCoverHandler() {
+        if (sTouchCoverHandler == null) {
+            final HandlerThread thread = new HandlerThread("abc-touch-cover",
+                    Process.THREAD_PRIORITY_DISPLAY);
+            thread.start();
+            sTouchCoverHandler = new Handler(thread.getLooper());
+        }
+        return sTouchCoverHandler;
+    }
+
+    private final class MiuiAmbientPolicy implements SensorEventListener {
+        private final Sensor mAssistSensor;
+        private final Handler mPolicyHandler;
+        private final AmbientLightRingBuffer mAssistRingBuffer;
+        private final Spline mBrighteningSpline;
+        private final Spline mBrighteningSmallSpline;
+        private final Spline mDarkeningSpline;
+        private final Rect mTouchCoverRect = new Rect();
+
+        private boolean mEnabled;
+        private boolean mAssistLuxValid;
+        private long mAssistEnableTime;
+        private int mUseSensor = MIUI_LUX_INVALID;
+        private float mMainFastLux = -1f;
+        private float mMainSlowLux = -1f;
+        private float mAssistFastLux = -1f;
+        private float mAssistSlowLux = -1f;
+        private float mAssistBrighteningThreshold = -1f;
+        private float mAssistBrighteningSmallThreshold = -1f;
+        private float mAssistDarkeningThreshold = -1f;
+
+        private CameraManager mCameraManager;
+        private boolean mTorchOn;
+        private long mTorchOffTime;
+        private final CameraManager.TorchCallback mTorchCallback =
+                new CameraManager.TorchCallback() {
+                    @Override
+                    public void onTorchModeChanged(@NonNull String cameraId, boolean enabled) {
+                        if (mTorchOn && !enabled) {
+                            mTorchOffTime = mClock.uptimeMillis();
+                        }
+                        mTorchOn = enabled;
+                    }
+                };
+
+        // Touches are tracked on their own thread, like the miui-gesture thread of HyperOS
+        private final Handler mTouchHandler;
+        private InputMonitor mInputMonitor;
+        private InputEventReceiver mInputReceiver;
+        private int mPointersInArea;
+        private volatile boolean mTouchingInArea;
+        private volatile long mLastTouchInAreaTime = -MIUI_GAME_TOUCH_DROP_MS;
+        private final ContentObserver mGameObserver;
+        private boolean mGameActive;
+        private long mEnterGameTime;
+        private final DisplayManager.DisplayListener mDisplayListener =
+                new DisplayManager.DisplayListener() {
+                    @Override
+                    public void onDisplayAdded(int displayId) {
+                    }
+
+                    @Override
+                    public void onDisplayRemoved(int displayId) {
+                    }
+
+                    @Override
+                    public void onDisplayChanged(int displayId) {
+                        if (displayId == Display.DEFAULT_DISPLAY) {
+                            updateTouchCoverRect();
+                        }
+                    }
+                };
+
+        MiuiAmbientPolicy(Sensor assistSensor, Looper looper) {
+            mAssistSensor = assistSensor;
+            mPolicyHandler = new Handler(looper) {
+                @Override
+                public void handleMessage(Message msg) {
+                    if (msg.what == MSG_UPDATE_ASSIST_LUX) {
+                        long time = mClock.uptimeMillis();
+                        mAssistRingBuffer.prune(time - MIUI_RING_BUFFER_HORIZON_MS);
+                        updateAssistAmbientLux(time);
+                    }
+                }
+            };
+            mTouchHandler = getTouchCoverHandler();
+            mGameObserver = new ContentObserver(mPolicyHandler) {
+                @Override
+                public void onChange(boolean selfChange) {
+                    updateGameActive();
+                }
+            };
+            mAssistRingBuffer = new AmbientLightRingBuffer(mNormalLightSensorRate,
+                    mAmbientLightHorizonLong, mClock);
+            float[] smallThresholds = new float[MIUI_BRIGHTENING_LUX.length];
+            for (int i = 0; i < MIUI_BRIGHTENING_LUX.length; i++) {
+                if (MIUI_BRIGHTENING_LUX[i] <= 10f) {
+                    smallThresholds[i] = MIUI_BRIGHTENING_THRESHOLDS[i];
+                } else {
+                    smallThresholds[i] = Math.max(MIUI_BRIGHTENING_THRESHOLDS[i]
+                            * MIUI_RATIO_FOR_BRIGHTEN_SMALL_THRESHOLD + MIUI_BRIGHTENING_LUX[i]
+                            * (1f - MIUI_RATIO_FOR_BRIGHTEN_SMALL_THRESHOLD),
+                            MIUI_BRIGHTENING_THRESHOLDS[i - 1]);
+                }
+            }
+            mBrighteningSpline = Spline.createLinearSpline(MIUI_BRIGHTENING_LUX,
+                    MIUI_BRIGHTENING_THRESHOLDS);
+            mBrighteningSmallSpline = Spline.createLinearSpline(MIUI_BRIGHTENING_LUX,
+                    smallThresholds);
+            mDarkeningSpline = Spline.createLinearSpline(MIUI_DARKENING_LUX,
+                    MIUI_DARKENING_THRESHOLDS);
+            Slog.i(TAG, "MiuiAmbientPolicy: assist light sensor " + mAssistSensor.getName());
+        }
+
+        float brighteningThreshold(float lux) {
+            return lux > MIUI_HBM_MINIMUM_LUX ? lux + 1f : mBrighteningSpline.interpolate(lux);
+        }
+
+        float brighteningSmallThreshold(float lux) {
+            return lux > MIUI_HBM_MINIMUM_LUX ? lux + 1f
+                    : mBrighteningSmallSpline.interpolate(lux);
+        }
+
+        float darkeningThreshold(float lux) {
+            return mDarkeningSpline.interpolate(lux);
+        }
+
+        boolean isUsingMainSensor() {
+            return mUseSensor == MIUI_USE_MAIN_SENSOR;
+        }
+
+        void setEnabled(boolean enable) {
+            if (enable && !mEnabled) {
+                mEnabled = true;
+                mAssistEnableTime = mClock.uptimeMillis();
+                mSensorManager.registerListener(this, mAssistSensor,
+                        mNormalLightSensorRate * 1000, mPolicyHandler);
+                try {
+                    mCameraManager = mContext.getSystemService(CameraManager.class);
+                    mCameraManager.registerTorchCallback(mTorchCallback, mPolicyHandler);
+                } catch (Exception e) {
+                    Slog.w(TAG, "MiuiAmbientPolicy: torch callback unavailable", e);
+                    mCameraManager = null;
+                }
+                setTouchTrackingEnabled(true);
+                mContext.getContentResolver().registerContentObserver(
+                        Settings.Secure.getUriFor(MIUI_GAMING_MODE_ACTIVE), false,
+                        mGameObserver, UserHandle.USER_ALL);
+                updateGameActive();
+            } else if (!enable && mEnabled) {
+                mEnabled = false;
+                mAssistLuxValid = false;
+                mAssistRingBuffer.clear();
+                mUseSensor = MIUI_LUX_INVALID;
+                mMainFastLux = -1f;
+                mMainSlowLux = -1f;
+                mAssistFastLux = -1f;
+                mAssistSlowLux = -1f;
+                mPolicyHandler.removeMessages(MSG_UPDATE_ASSIST_LUX);
+                mSensorManager.unregisterListener(this);
+                if (mCameraManager != null) {
+                    mCameraManager.unregisterTorchCallback(mTorchCallback);
+                    mCameraManager = null;
+                }
+                setTouchTrackingEnabled(false);
+                mContext.getContentResolver().unregisterContentObserver(mGameObserver);
+            }
+        }
+
+        @Override
+        public void onSensorChanged(SensorEvent event) {
+            if (!mEnabled) {
+                return;
+            }
+            final long time = mClock.uptimeMillis();
+            mPolicyHandler.removeMessages(MSG_UPDATE_ASSIST_LUX);
+            // The torch lights the rear sensor
+            if (mTorchOn || time - mTorchOffTime <= MIUI_TORCH_OFF_ASSIST_DELAY_MS) {
+                return;
+            }
+            mAssistRingBuffer.prune(time - MIUI_RING_BUFFER_HORIZON_MS);
+            mAssistRingBuffer.push(time, event.values[0]);
+            updateAssistAmbientLux(time);
+        }
+
+        @Override
+        public void onAccuracyChanged(Sensor sensor, int accuracy) {
+        }
+
+        private float calculateAssistAmbientLux(long now, long horizon) {
+            final int n = mAssistRingBuffer.size();
+            if (n == 0) {
+                return -1f;
+            }
+            int endIndex = 0;
+            final long horizonStartTime = now - horizon;
+            for (int i = 0; i < n - 1 && mAssistRingBuffer.getTime(i + 1) <= horizonStartTime;
+                    i++) {
+                endIndex++;
+            }
+            float sum = 0;
+            float totalWeight = 0;
+            long endTime = AMBIENT_LIGHT_PREDICTION_TIME_MILLIS;
+            for (int i = n - 1; i >= endIndex; i--) {
+                long eventTime = mAssistRingBuffer.getTime(i);
+                if (i == endIndex && eventTime < horizonStartTime) {
+                    eventTime = horizonStartTime;
+                }
+                final long startTime = eventTime - now;
+                final float weight = calculateWeight(startTime, endTime);
+                totalWeight += weight;
+                sum += mAssistRingBuffer.getLux(i) * weight;
+                endTime = startTime;
+            }
+            return sum / totalWeight;
+        }
+
+        private long nextAssistBrighteningTransition(long time, float threshold, long debounce) {
+            long earliestValidTime = time;
+            for (int i = mAssistRingBuffer.size() - 1;
+                    i >= 0 && mAssistRingBuffer.getLux(i) > threshold; i--) {
+                earliestValidTime = mAssistRingBuffer.getTime(i);
+            }
+            return earliestValidTime + debounce;
+        }
+
+        private long nextAssistDarkeningTransition(long time) {
+            long earliestValidTime = time;
+            for (int i = mAssistRingBuffer.size() - 1;
+                    i >= 0 && mAssistRingBuffer.getLux(i) < mAssistDarkeningThreshold; i--) {
+                earliestValidTime = mAssistRingBuffer.getTime(i);
+            }
+            return earliestValidTime + mDarkeningLightDebounceConfig;
+        }
+
+        private void updateAssistThresholds() {
+            mAssistBrighteningThreshold = brighteningThreshold(mAssistFastLux);
+            mAssistDarkeningThreshold = darkeningThreshold(mAssistFastLux);
+            mAssistBrighteningSmallThreshold = brighteningSmallThreshold(mAssistFastLux);
+        }
+
+        // AutomaticBrightnessController#setAmbientLux(event, lux, needUpdateLux, needUpdateBrightness)
+        private void applyAmbientLux(boolean mainEvent, float lux, boolean updateLux,
+                boolean updateBrightness) {
+            if (updateLux) {
+                mPreThresholdLux = mAmbientLux;
+                mAmbientLux = Math.max(lux, 0f);
+            }
+            // The thresholds follow the front sensor even while the rear one sets the lux
+            if (mainEvent || mUseSensor == MIUI_USE_MAIN_SENSOR) {
+                mAmbientBrighteningThreshold = brighteningThreshold(mMainFastLux);
+                mAmbientDarkeningThreshold = darkeningThreshold(mMainFastLux);
+                mAmbientBrighteningSmallThreshold = brighteningSmallThreshold(mMainFastLux);
+            }
+            if (updateLux) {
+                Slog.i(TAG, "MiuiAmbientPolicy: " + (mainEvent ? "main" : "assist")
+                        + " event, sensor=" + (isUsingMainSensor() ? "main" : "assist")
+                        + ", mAmbientLux=" + mAmbientLux + ", mPreThresholdLux="
+                        + mPreThresholdLux + ", mMainFastLux=" + mMainFastLux
+                        + ", mAssistFastLux=" + mAssistFastLux);
+                mBrightnessRangeController.onAmbientLuxChange(mAmbientLux);
+                mShortTermModel.maybeReset(mAmbientLux);
+                if (updateBrightness) {
+                    updateAutoBrightness(true /* sendUpdate */, false /* isManuallySet */);
+                }
+            }
+        }
+
+        // DualSensorPolicy#setAmbientLuxWhenInvalid(HANDLE_MAIN_LUX_EVENT)
+        void initMainAmbientLux(float lux) {
+            mMainSlowLux = lux;
+            mMainFastLux = lux;
+            if (mUseSensor != MIUI_USE_ASSIST_SENSOR || lux >= mAssistFastLux) {
+                mUseSensor = MIUI_USE_MAIN_SENSOR;
+                applyAmbientLux(true, lux, true, false);
+            } else {
+                applyAmbientLux(true, lux, false, false);
+            }
+        }
+
+        // AutomaticBrightnessControllerImpl#shouldSkipBrighteningTransition: right after the
+        // sensor turns on, a much brighter sample is taken at once
+        boolean skipBrighteningTransition() {
+            final int n = mAmbientLightRingBuffer.size();
+            if (n == 0) {
+                return false;
+            }
+            final float lux = mAmbientLightRingBuffer.getLux(n - 1);
+            if (mClock.uptimeMillis() > mLightSensorEnableTime + MIUI_ALLOW_FAST_RATE_TIME_MS
+                    || lux < mAmbientBrighteningThreshold
+                    || lux < MIUI_SKIP_TRANSITION_LUX + mAmbientLux
+                    || lux < MIUI_ALLOW_FAST_RATE_RATIO * mAmbientLux + mAmbientLux) {
+                return false;
+            }
+            if (!isUsingMainSensor() && lux < mAssistFastLux) {
+                return false;
+            }
+            mUseSensor = MIUI_USE_MAIN_SENSOR;
+            mMainSlowLux = lux;
+            mMainFastLux = lux;
+            Slog.i(TAG, "MiuiAmbientPolicy: skip brightening transition, lux=" + lux
+                    + ", mAmbientLux=" + mAmbientLux);
+            applyAmbientLux(true, lux, true, true);
+            return true;
+        }
+
+        // DualSensorPolicy#updateDualSensorPolicy(HANDLE_MAIN_LUX_EVENT)
+        void updateMainAmbientLux(long time) {
+            mMainSlowLux = calculateAmbientLux(time, mAmbientLightHorizonLong);
+            mMainFastLux = calculateAmbientLux(time, mAmbientLightHorizonShort);
+            final float brighteningThreshold = mMainFastLux < mAmbientBrighteningThreshold
+                    ? mAmbientBrighteningSmallThreshold : mAmbientBrighteningThreshold;
+            final float darkeningThreshold = mAmbientDarkeningThreshold;
+            long nextBrightenTransition = nextAmbientLightBrighteningTransition(time, mMainFastLux);
+            long nextDarkenTransition = nextAmbientLightDarkeningTransition(time);
+            if (mMainSlowLux >= brighteningThreshold && mMainFastLux >= brighteningThreshold
+                    && nextBrightenTransition <= time) {
+                if (isUsingMainSensor() || (mUseSensor == MIUI_USE_ASSIST_SENSOR
+                        && mMainFastLux >= mAssistFastLux)) {
+                    mUseSensor = MIUI_USE_MAIN_SENSOR;
+                    applyAmbientLux(true, mMainFastLux, true, true);
+                } else {
+                    applyAmbientLux(true, mMainFastLux, false, false);
+                }
+                nextBrightenTransition = nextAmbientLightBrighteningTransition(time);
+                nextDarkenTransition = nextAmbientLightDarkeningTransition(time);
+            } else if (mMainFastLux <= darkeningThreshold && nextDarkenTransition <= time) {
+                if (mUseSensor != MIUI_LUX_INVALID && mMainFastLux >= mAssistFastLux) {
+                    mUseSensor = MIUI_USE_MAIN_SENSOR;
+                    applyAmbientLux(true, mMainFastLux, true, true);
+                } else if (isUsingMainSensor()) {
+                    // The front fell below the rear: follow the rear
+                    mUseSensor = MIUI_USE_ASSIST_SENSOR;
+                    updateAssistThresholds();
+                    applyAmbientLux(true, mAssistFastLux, true, true);
+                } else {
+                    applyAmbientLux(true, mMainFastLux, false, false);
+                }
+                nextBrightenTransition = nextAmbientLightBrighteningTransition(time);
+                nextDarkenTransition = nextAmbientLightDarkeningTransition(time);
+            }
+            final long nextTransitionTime = Math.min(nextDarkenTransition, nextBrightenTransition);
+            mHandler.sendEmptyMessageAtTime(MSG_UPDATE_AMBIENT_LUX, convertToUptime(
+                    nextTransitionTime > time ? nextTransitionTime
+                            : time + mNormalLightSensorRate));
+        }
+
+        private void updateAssistAmbientLux(long time) {
+            if (!mAssistLuxValid) {
+                final long warmedUpTime = mLightSensorWarmUpTimeConfig + mAssistEnableTime;
+                if (time < warmedUpTime) {
+                    mPolicyHandler.sendEmptyMessageAtTime(MSG_UPDATE_ASSIST_LUX, warmedUpTime);
+                    return;
+                }
+                // DualSensorPolicy#setAmbientLuxWhenInvalid(HANDLE_ASSIST_LUX_EVENT)
+                mAssistFastLux = calculateAssistAmbientLux(time, mAmbientLightHorizonShort);
+                mAssistSlowLux = mAssistFastLux;
+                if ((isUsingMainSensor() && mAssistFastLux > mAmbientBrighteningThreshold)
+                        || (mUseSensor == MIUI_USE_ASSIST_SENSOR
+                                && mAssistFastLux >= mAssistBrighteningThreshold
+                                && mAssistFastLux > mMainFastLux)) {
+                    mUseSensor = MIUI_USE_ASSIST_SENSOR;
+                    applyAmbientLux(false, mAssistFastLux, true, true);
+                }
+                updateAssistThresholds();
+                mAssistLuxValid = true;
+            }
+
+            // DualSensorPolicy#updateDualSensorPolicy(HANDLE_ASSIST_LUX_EVENT)
+            mAssistSlowLux = calculateAssistAmbientLux(time, mAmbientLightHorizonLong);
+            mAssistFastLux = calculateAssistAmbientLux(time, mAmbientLightHorizonShort);
+            final boolean small = mAssistFastLux < mAssistBrighteningThreshold;
+            final float assistBrighteningThreshold = small
+                    ? mAssistBrighteningSmallThreshold : mAssistBrighteningThreshold;
+            long nextBrightenTransition = nextAssistBrighteningTransition(time,
+                    assistBrighteningThreshold, small ? MIUI_SMALL_BRIGHTENING_DEBOUNCE_MS
+                            : mBrighteningLightDebounceConfig);
+            long nextDarkenTransition = nextAssistDarkeningTransition(time);
+            if ((mAssistSlowLux >= assistBrighteningThreshold
+                    && mAssistFastLux >= assistBrighteningThreshold
+                    && nextBrightenTransition <= time)
+                    || (mAssistFastLux <= mAssistDarkeningThreshold
+                            && nextDarkenTransition <= time)) {
+                if ((isUsingMainSensor() && mAssistSlowLux > mAmbientBrighteningThreshold
+                        && mAssistFastLux > mAmbientBrighteningThreshold)
+                        || (mUseSensor == MIUI_USE_ASSIST_SENSOR
+                                && mAssistFastLux > mMainFastLux)) {
+                    mUseSensor = MIUI_USE_ASSIST_SENSOR;
+                    applyAmbientLux(false, mAssistFastLux, true, true);
+                } else if (mUseSensor == MIUI_USE_ASSIST_SENSOR) {
+                    mUseSensor = MIUI_USE_MAIN_SENSOR;
+                    applyAmbientLux(false, mMainFastLux, true, true);
+                }
+                updateAssistThresholds();
+                nextBrightenTransition = nextAssistBrighteningTransition(time,
+                        mAssistBrighteningThreshold, mBrighteningLightDebounceConfig);
+                nextDarkenTransition = nextAssistDarkeningTransition(time);
+            }
+            final long nextTransitionTime = Math.min(nextDarkenTransition, nextBrightenTransition);
+            mPolicyHandler.sendEmptyMessageAtTime(MSG_UPDATE_ASSIST_LUX,
+                    nextTransitionTime > time ? nextTransitionTime
+                            : time + mNormalLightSensorRate);
+        }
+
+        // TouchCoverProtectionHelper: in landscape a finger over the front ALS area drops its
+        // samples while it touches there and for a moment after
+        boolean isTouchCoverProtectionActive() {
+            return mTouchingInArea || mClock.uptimeMillis() - mLastTouchInAreaTime
+                    < MIUI_TOUCH_EVENT_DEBOUNCE_MS;
+        }
+
+        // AutomaticBrightnessControllerImpl.dropDecreaseLuxIfNeeded
+        boolean dropDecreaseLuxInGame() {
+            if (!mGameActive) {
+                return false;
+            }
+            final long now = mClock.uptimeMillis();
+            return now - mEnterGameTime <= MIUI_GAME_ENTER_DROP_MS
+                    || now - mLastTouchInAreaTime <= MIUI_GAME_TOUCH_DROP_MS;
+        }
+
+        private void updateGameActive() {
+            final boolean active = Settings.Secure.getIntForUser(mContext.getContentResolver(),
+                    MIUI_GAMING_MODE_ACTIVE, 0, UserHandle.USER_CURRENT) != 0;
+            if (active && !mGameActive) {
+                mEnterGameTime = mClock.uptimeMillis();
+            }
+            if (active != mGameActive) {
+                Slog.i(TAG, "MiuiAmbientPolicy: game scene " + (active ? "on" : "off"));
+            }
+            mGameActive = active;
+        }
+
+        private void setTouchTrackingEnabled(boolean enable) {
+            mTouchHandler.post(() -> updateTouchTracking(enable));
+        }
+
+        private void updateTouchTracking(boolean enable) {
+            if (enable && mInputMonitor == null) {
+                try {
+                    mInputMonitor = mContext.getSystemService(InputManager.class)
+                            .monitorGestureInput("abc-touch-cover", Display.DEFAULT_DISPLAY);
+                    mInputReceiver = new InputEventReceiver(mInputMonitor.getInputChannel(),
+                            mTouchHandler.getLooper()) {
+                        @Override
+                        public void onInputEvent(InputEvent event) {
+                            if (event instanceof MotionEvent) {
+                                onTouchEvent((MotionEvent) event);
+                            }
+                            finishInputEvent(event, false /* handled */);
+                        }
+                    };
+                } catch (Exception e) {
+                    Slog.w(TAG, "MiuiAmbientPolicy: touch monitor unavailable", e);
+                    mInputMonitor = null;
+                    return;
+                }
+                mContext.getSystemService(DisplayManager.class)
+                        .registerDisplayListener(mDisplayListener, mTouchHandler);
+                updateTouchCoverRect();
+            } else if (!enable && mInputMonitor != null) {
+                mContext.getSystemService(DisplayManager.class)
+                        .unregisterDisplayListener(mDisplayListener);
+                mInputReceiver.dispose();
+                mInputReceiver = null;
+                mInputMonitor.dispose();
+                mInputMonitor = null;
+                mPointersInArea = 0;
+                mTouchingInArea = false;
+            }
+        }
+
+        private void onTouchEvent(MotionEvent event) {
+            if (!event.isTouchEvent()) {
+                return;
+            }
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                case MotionEvent.ACTION_MOVE:
+                case MotionEvent.ACTION_POINTER_DOWN:
+                    for (int i = 0; i < event.getPointerCount(); i++) {
+                        final int bit = 1 << event.getPointerId(i);
+                        if (mTouchCoverRect.contains(Math.round(event.getX(i)),
+                                Math.round(event.getY(i)))) {
+                            mPointersInArea |= bit;
+                        } else {
+                            mPointersInArea &= ~bit;
+                        }
+                    }
+                    break;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    mPointersInArea = 0;
+                    break;
+                case MotionEvent.ACTION_POINTER_UP:
+                    mPointersInArea &= ~(1 << event.getPointerId(event.getActionIndex()));
+                    break;
+            }
+            mTouchingInArea = mPointersInArea != 0;
+            if (mTouchingInArea) {
+                mLastTouchInAreaTime = mClock.uptimeMillis();
+            }
+        }
+
+        private void updateTouchCoverRect() {
+            final DisplayInfo info = LocalServices.getService(DisplayManagerInternal.class)
+                    .getDisplayInfo(Display.DEFAULT_DISPLAY);
+            if (info == null) {
+                return;
+            }
+            final float physicalWidth = info.getMode().getPhysicalWidth();
+            final float physicalHeight = info.getMode().getPhysicalHeight();
+            // Only in landscape, where the hand holding the phone covers the sensor
+            if (info.rotation == Surface.ROTATION_90) {
+                mTouchCoverRect.set(MIUI_TOUCH_COVER_RECT[1], (int) (physicalWidth
+                        - MIUI_TOUCH_COVER_RECT[2]), MIUI_TOUCH_COVER_RECT[3],
+                        (int) (physicalWidth - MIUI_TOUCH_COVER_RECT[0]));
+                mTouchCoverRect.scale(info.logicalHeight / physicalWidth);
+            } else if (info.rotation == Surface.ROTATION_270) {
+                mTouchCoverRect.set((int) (physicalHeight - MIUI_TOUCH_COVER_RECT[3]),
+                        MIUI_TOUCH_COVER_RECT[0], (int) (physicalHeight
+                                - MIUI_TOUCH_COVER_RECT[1]), MIUI_TOUCH_COVER_RECT[2]);
+                mTouchCoverRect.scale(info.logicalHeight / physicalWidth);
+            } else {
+                mTouchCoverRect.setEmpty();
+            }
+        }
+
+        void dump(PrintWriter pw) {
+            pw.println("  MiuiAmbientPolicy:");
+            pw.println("    mAssistSensor=" + mAssistSensor.getName());
+            pw.println("    mUseSensor=" + (isUsingMainSensor() ? "main"
+                    : mUseSensor == MIUI_USE_ASSIST_SENSOR ? "assist" : "invalid"));
+            pw.println("    mMainFastLux=" + mMainFastLux + ", mMainSlowLux=" + mMainSlowLux);
+            pw.println("    mAssistFastLux=" + mAssistFastLux + ", mAssistSlowLux="
+                    + mAssistSlowLux);
+            pw.println("    mAmbientBrighteningSmallThreshold="
+                    + mAmbientBrighteningSmallThreshold);
+            pw.println("    mAssistBrighteningThreshold=" + mAssistBrighteningThreshold
+                    + ", mAssistBrighteningSmallThreshold=" + mAssistBrighteningSmallThreshold
+                    + ", mAssistDarkeningThreshold=" + mAssistDarkeningThreshold);
+            pw.println("    mAssistRingBuffer=" + mAssistRingBuffer);
+            pw.println("    mTorchOn=" + mTorchOn + ", mTouchCoverRect=" + mTouchCoverRect
+                    + ", isTouchCoverProtectionActive=" + isTouchCoverProtectionActive());
+            pw.println("    mGameActive=" + mGameActive + ", dropDecreaseLuxInGame="
+                    + dropDecreaseLuxInGame());
         }
     }
 
